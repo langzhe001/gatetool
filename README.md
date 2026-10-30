@@ -7,7 +7,9 @@
 |---|---|---|---|
 | `gate.yml` | `vpngate.py` | 每 3 小时 | `sstp.json`(含机房节点) `sstp.txt`(vless 订阅) `sstp.yaml`(Clash) `sstp-chains.txt` `sstp-hosts.txt` (后四者在住宅节点 > 20 个时不含机房节点) |
 | `ovpn.yml` | `refresh_ovpn.py` | 每 3 小时 | `ovpn.json`(Pages, 含机房节点) `ovpn.yaml`(Clash, 私有 Worker; 住宅节点 > 20 个时不含机房节点) |
-| `pool.yml` | `refresh_pool.py` | 每天检查, 周日 11:00(北京)刷新 | `pool.json` `pool.txt`(vless 订阅) `pool.yaml`(Clash) |
+| `pool.yml` | `refresh_pool.py` | 名单推送时 / 每天检查, 周日 11:00(北京)刷新 | `pool.json` `pool.txt`(vless 订阅) `pool.yaml`(Clash) |
+
+优选池节点不再自动测速: 名单就是仓库根目录的 `preferred_hosts.txt` (手动上传/编辑, 一行一个优选 IP 或域名, 可带 `:端口`, 不写默认 443), 改名单后推送即触发刷新, 也可在 Actions 页手动运行 `CF Edge Pool Refresh`。
 
 数据文件只在工作流运行时生成并发布到 Pages, 不提交到仓库。
 

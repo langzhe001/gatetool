@@ -1,51 +1,50 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cloudflare 边缘优选池自动刷新。
+Cloudflare 边缘优选池刷新 (手动录入版, 不再自动测速)。
 
-数据源 : Cloudflare 官方公布的 IP 段
-          https://www.cloudflare.com/ips-v4
-          https://www.cloudflare.com/ips-v6
-流程   : 拉取 IP 段 -> 随机采样 -> 并发测 443 端口 TLS 握手延迟
-          (SNI = 自己的域名, 握手成功即证明该 IP 是可用 CF 边缘)
-          -> 按延迟排序取前 POOL_SIZE 个 -> 写入 pool.json (监控页用)
+节点来源 : 仓库根目录的 preferred_hosts.txt (手动上传/编辑维护),
+          一行一个优选 IP 或域名, 这就是节点的最终名单和顺序。
+流程   : 读取手动名单 -> 清洗/去重/校验 -> 写入 pool.json (监控页用)
           -> 生成 pool.txt (vless 明文订阅) / pool.yaml (Clash 订阅)
+
+不再拉取 Cloudflare 官方 IP 段、不再随机采样、不再做 TLS 握手测速:
+名单里有什么, 订阅里就有什么; 要换节点只改 preferred_hosts.txt 后重跑工作流。
 
 只用标准库, 无第三方依赖。
 
+preferred_hosts.txt 格式:
+  # 以 # 开头的行是注释, 空行忽略
+  1.2.3.4
+  1.2.3.4:8443
+  cf.example.com
+  cf.example.com:443
+  [2606:4700::1]:443
+  也可以直接粘贴带 https:// 的域名, 会自动只取域名部分。
+
 环境变量:
-  EDT_DOMAIN   必填, 你自己的域名(已托管在 Cloudflare), 用作 TLS SNI 测试
-  POOL_SIZE    选填, 保留最快的前 N 个, 默认 40
-  SAMPLE_SIZE  选填, 每轮采样的 IP 数量, 默认 300
-  TIMEOUT      选填, 单 IP 连接/握手超时秒数, 默认 8
-  MIN_KEEP     选填, 可用 IP 少于此数则报错退出(防止提交坏池子), 默认 10
-  WORKERS      选填, 并发线程数, 默认 32; 设为 1 则串行(网络受限环境用)
-  V6_RATIO     选填, 采样中 IPv6 占比, 默认 0 (只采 IPv4; 设为如 0.15 则混采)
-  OUT_DIR      选填, 输出目录, 默认脚本所在目录
-  EDT_UUID     选填, 你的 edgetunnel UUID; 设置后额外生成 pool.txt
-               (vless 订阅, 每个池子 IP 一条直连节点)
-  SUB_PATH     选填, 覆盖默认的 WS 路径格式 (默认: /随机伪装路径/proxyip=池子IP)
-  SUB_FP       选填, TLS fingerprint, 默认 chrome
-  SUB_PREFIX   选填, 订阅节点名前缀; 为空则按 IP 类型自动命名
-               (IPv4 -> IPv4优选, IPv6 -> IPv6优选, 与 worker 别名规则一致)
+  EDT_DOMAIN       必填, 你自己的域名(已托管在 Cloudflare), 用作订阅的 SNI / Host
+  EDT_UUID         选填, 你的 edgetunnel UUID; 设置后生成 pool.txt / pool.yaml
+  MANUAL_HOSTS     选填, 直接用环境变量给名单 (逗号/空白分隔), 优先于文件
+  MANUAL_HOSTS_FILE 选填, 名单文件路径, 默认脚本同目录的 preferred_hosts.txt
+  OUT_DIR          选填, 输出目录, 默认脚本所在目录
+  SUB_PATH         选填, 覆盖默认的 WS 路径格式 (默认: /随机伪装路径/proxyip=池子节点)
+  SUB_FP           选填, TLS fingerprint, 默认 chrome
+  SUB_PREFIX       选填, 订阅节点名前缀; 为空则按类型自动命名
+                   (IPv4 -> IPv4优选, IPv6 -> IPv6优选, 域名 -> 域名优选)
 """
 
-import concurrent.futures as futures
 import ipaddress
 import json
 import os
 import random
-import socket
-import ssl
+import re
 import sys
-import time
-import urllib.request
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 
-IPV4_URL = "https://www.cloudflare.com/ips-v4"
-IPV6_URL = "https://www.cloudflare.com/ips-v6"
 BEIJING = timezone(timedelta(hours=8))
+DEFAULT_PORT = 443
 
 
 def log(msg):
@@ -57,78 +56,105 @@ def die(msg):
     sys.exit(1)
 
 
-def fetch_cidrs(url, timeout=30):
-    """拉取官方 IP 段列表, 返回 ipaddress 网络对象列表。"""
-    req = urllib.request.Request(url, headers={"User-Agent": "cf-edge-pool/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        text = r.read().decode("utf-8")
-    nets = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            nets.append(ipaddress.ip_network(line))
-        except ValueError:
-            log(f"[警告] 跳过无法解析的行: {line}")
-    return nets
+def parse_entry(raw):
+    """把一行手动录入解析成 (host, port); 非法返回 None。
 
+    支持: IPv4 / IPv4:端口 / 域名 / 域名:端口 / IPv6 / [IPv6]:端口 /
+          带 https:// 前缀或尾随路径的域名 (只取域名部分)。
+    """
+    s = raw.strip()
+    if not s or s.startswith("#"):
+        return None
+    s = s.split("#", 1)[0].strip()          # 行内注释
+    s = s.split()[0] if s.split() else ""   # 只取第一个字段
+    s = s.strip(",;")
+    if not s:
+        return None
+    if "://" in s:                          # 粘贴了完整 URL 时只取主机部分
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0].strip()
+    if not s:
+        return None
 
-def sample_ips(nets, count, v6_ratio=0.15):
-    """从各网段随机采样。v4/v6 按比例分配(v6 网段地址空间巨大,
-    不能按地址数加权, 否则几乎全采到 v6)。返回去重后的 IP 字符串列表。"""
-    v4_nets = [n for n in nets if n.version == 4]
-    v6_nets = [n for n in nets if n.version == 6]
-    v6_count = round(count * v6_ratio) if v6_nets else 0
-    v4_count = count - v6_count
-    picked = set()
-    for nets_part, c in ((v4_nets, v4_count), (v6_nets, v6_count)):
-        if not nets_part or c <= 0:
-            continue
-        weights = [n.num_addresses for n in nets_part]
-        total = sum(weights)
-        for _ in range(c):
-            r = random.uniform(0, total)
-            acc = 0
-            for net, w in zip(nets_part, weights):
-                acc += w
-                if r <= acc:
-                    base = int(net.network_address)
-                    lo = base + 1
-                    hi = base + net.num_addresses - 2
-                    ip = (net.network_address if hi < lo
-                          else ipaddress.ip_address(random.randint(lo, hi)))
-                    picked.add(str(ip))
-                    break
-    return sorted(picked)
+    host, port = s, DEFAULT_PORT
+    if s.startswith("["):                   # [IPv6] 或 [IPv6]:端口
+        end = s.find("]")
+        if end == -1:
+            return None
+        host = s[1:end]
+        rest = s[end + 1:]
+        if rest.startswith(":") and rest[1:].isdigit():
+            port = int(rest[1:])
+        elif rest:
+            return None
+    elif s.count(":") == 1:                 # IPv4:端口 或 域名:端口
+        h, p = s.rsplit(":", 1)
+        if p.isdigit():
+            host, port = h, int(p)
+    # s.count(":") >= 2 且无括号: 整段就是 IPv6 地址, 端口用默认
 
-
-def test_one(ip, sni, timeout):
-    """对单个 IP 做 TCP+TLS 握手, 返回 (ip, 延迟毫秒或 None)。"""
-    t0 = time.monotonic()
-    sock = None
+    if not (1 <= port <= 65535):
+        return None
     try:
-        sock = socket.create_connection((ip, 443), timeout=timeout)
-        # 只验证"握手能成功", 不校验证书(测的是连通性和延迟)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        tls = ctx.wrap_socket(sock, server_hostname=sni)
-        tls.do_handshake()
-        tls.close()
-        ms = (time.monotonic() - t0) * 1000
-        return ip, round(ms, 1)
-    except Exception:
-        return ip, None
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
+        ipaddress.ip_address(host)          # 合法 IP 直接通过
+        return host, port
+    except ValueError:
+        pass
+    # 域名校验: 标签由字母数字和连字符组成, 至少含一个点或为已知短域名形式
+    if len(host) > 253 or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return None
+    labels = host.split(".")
+    if any(not lb or lb.startswith("-") or lb.endswith("-") for lb in labels):
+        return None
+    return host, port
 
 
-# 随机伪装路径词表 (模仿真实网站路径, 后接 /proxyip=池子IP)
+def load_manual_hosts():
+    """按 MANUAL_HOSTS 环境变量 -> 名单文件的顺序读取手动名单。
+    返回 (entries, source_desc); entries = [(host, port), ...], 已去重保序。"""
+    raw_items = []
+    env_hosts = os.environ.get("MANUAL_HOSTS", "").strip()
+    if env_hosts:
+        raw_items = re.split(r"[\s,;]+", env_hosts)
+        source = "环境变量 MANUAL_HOSTS"
+    else:
+        path = os.environ.get("MANUAL_HOSTS_FILE", "").strip() or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "preferred_hosts.txt")
+        source = f"文件 {path}"
+        if not os.path.exists(path):
+            die(f"手动优选名单不存在: {path} — 请在仓库根目录上传 preferred_hosts.txt "
+                f"(一行一个优选 IP 或域名), 或设置环境变量 MANUAL_HOSTS")
+        with open(path, encoding="utf-8") as f:
+            raw_items = f.read().splitlines()
+
+    entries, seen = [], set()
+    for raw in raw_items:
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        parsed = parse_entry(raw)
+        if parsed is None:
+            log(f"[警告] 跳过无法解析的录入: {raw.strip()!r}")
+            continue
+        key = (parsed[0].lower(), parsed[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(parsed)
+    return entries, source
+
+
+def host_label(host):
+    try:
+        return "IPv6优选" if ipaddress.ip_address(host).version == 6 else "IPv4优选"
+    except ValueError:
+        return "域名优选"
+
+
+def host_for_url(host):
+    return f"[{host}]" if ":" in host else host
+
+
+# 随机伪装路径词表 (模仿真实网站路径, 后接 /proxyip=池子节点)
 _CAMO_WORDS = ["act", "api", "app", "assets", "channel", "classify", "comic",
                "details", "doc", "docs", "download", "favorite", "forum",
                "jump", "knowledge", "list", "magnet", "out", "pdf", "project",
@@ -146,81 +172,40 @@ def _random_camo_path():
 def main():
     sni = os.environ.get("EDT_DOMAIN", "").strip()
     if not sni:
-        die("缺少环境变量 EDT_DOMAIN (你的 Cloudflare 域名, 用作 TLS SNI 测试)")
-    pool_size = int(os.environ.get("POOL_SIZE", "40"))
-    sample_size = int(os.environ.get("SAMPLE_SIZE", "300"))
-    timeout = float(os.environ.get("TIMEOUT", "8"))
-    min_keep = int(os.environ.get("MIN_KEEP", "10"))
-    workers = int(os.environ.get("WORKERS", "32"))
-    v6_ratio = float(os.environ.get("V6_RATIO", "0"))
+        die("缺少环境变量 EDT_DOMAIN (你的 Cloudflare 域名, 用作订阅 SNI / Host)")
     out_dir = os.environ.get("OUT_DIR", os.path.dirname(os.path.abspath(__file__)))
     os.makedirs(out_dir, exist_ok=True)
 
-    log("== 1/4 拉取 Cloudflare 官方 IP 段 ==")
-    try:
-        nets = fetch_cidrs(IPV4_URL) + fetch_cidrs(IPV6_URL)
-    except Exception as exc:
-        die(f"拉取官方 IP 段失败: {exc}")
-    if not nets:
-        die("官方 IP 段为空")
-    v4 = sum(1 for n in nets if n.version == 4)
-    log(f"拿到 {len(nets)} 个网段 (v4: {v4}, v6: {len(nets) - v4})")
+    log("== 1/2 读取手动优选名单 (不测速) ==")
+    picked, source = load_manual_hosts()
+    log(f"来源: {source}; 有效节点 {len(picked)} 个")
+    if not picked:
+        die("手动优选名单为空 — 请往 preferred_hosts.txt 里一行一个填入优选 IP 或域名后重跑")
+    for host, port in picked:
+        log(f"  {host}:{port}")
 
-    log(f"== 2/4 随机采样 {sample_size} 个 IP ==")
-    ips = sample_ips(nets, sample_size, v6_ratio)
-    log(f"去重后 {len(ips)} 个")
-
-    log(f"== 3/4 测 TLS 握手 (SNI 已设置, 超时 {timeout}s, 并发 {workers}) ==")
-    ok = []
-    if workers <= 1:
-        for i, ip in enumerate(ips, 1):
-            _, ms = test_one(ip, sni, timeout)
-            if ms is not None:
-                ok.append((ip, ms))
-            if i % 20 == 0:
-                log(f"  进度 {i}/{len(ips)}, 可用 {len(ok)}")
-    else:
-        with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(test_one, ip, sni, timeout): ip for ip in ips}
-            done = 0
-            for fut in futures.as_completed(futs):
-                done += 1
-                ip, ms = fut.result()
-                if ms is not None:
-                    ok.append((ip, ms))
-                if done % 50 == 0:
-                    log(f"  进度 {done}/{len(ips)}, 可用 {len(ok)}")
-    ok.sort(key=lambda x: x[1])
-    log(f"测完: 可用 {len(ok)}/{len(ips)}")
-
-    if len(ok) < min_keep:
-        die(f"可用 IP 只有 {len(ok)} 个, 少于 MIN_KEEP={min_keep}, 拒绝提交坏池子")
-
-    picked = ok[:pool_size]
-    log(f"== 4/4 取最快 {len(picked)} 个写入池子 ==")
-    for ip, ms in picked:
-        log(f"  {ip}:443  {ms}ms")
-
+    log("== 2/2 按名单顺序写入池子 ==")
     now = datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M")
-    # pool.json 只供监控页用, 不对外发布下载
+    # pool.json 只供监控页用, 不对外发布下载; ip 字段沿用旧名, 值可为 IP 或域名
     json_path = os.path.join(out_dir, "pool.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "updated_at": now,
-                "source": ["https://www.cloudflare.com/ips-v4",
-                           "https://www.cloudflare.com/ips-v6"],
-                "sampled": len(ips),
-                "reachable": len(ok),
+                "mode": "manual",
+                "source": source if source.startswith("环境变量") else "preferred_hosts.txt",
+                "sampled": len(picked),
+                "reachable": len(picked),
                 "entries": [
-                    {"ip": ip, "port": 443, "latency_ms": ms} for ip, ms in picked
+                    {"ip": host, "port": port, "latency_ms": None}
+                    for host, port in picked
                 ],
             },
             f, ensure_ascii=False, indent=2,
         )
     log(f"已写入 {json_path} (仅供监控页)")
 
-    # 5/4 可选: 生成 vless 订阅 (每个池子 IP 一条直连节点)
+    # 可选: 生成 vless 订阅 (名单里每个条目一条直连节点)
     #   pool.txt 明文链接 (连接格式), pool.yaml Clash 订阅 (proxies 列表)
     uuid = os.environ.get("EDT_UUID", "").strip()
     if uuid and uuid != "REPLACE_WITH_YOUR_EDT_UUID":
@@ -228,37 +213,37 @@ def main():
         fp = os.environ.get("SUB_FP", "chrome")
         prefix = os.environ.get("SUB_PREFIX", "").strip()
         counters = {}
-        proxy_ips = ",".join(ip for ip, _ in random.sample(picked, min(8, len(picked))))
-        nodes = []  # (name, ip, ws_path)
+        proxy_hosts = ",".join(
+            f"{host_for_url(h)}:{p}" for h, p in random.sample(picked, min(8, len(picked))))
+        nodes = []  # (name, host, port, ws_path)
         link_lines = []
-        for ip, _ in picked:
-            host = f"[{ip}]" if ":" in ip else ip
-            label = prefix or ("IPv6优选" if ":" in ip else "IPv4优选")
+        for host, port in picked:
+            label = prefix or host_label(host)
             counters[label] = counters.get(label, 0) + 1
             name = f"{label}-{counters[label]:02d}"
-            ws_path = sub_path_override or f"{_random_camo_path()}/proxyip={proxy_ips}"
-            nodes.append((name, ip, ws_path))
+            ws_path = sub_path_override or f"{_random_camo_path()}/proxyip={proxy_hosts}"
+            nodes.append((name, host, port, ws_path))
             link_lines.append(
-                f"vless://{uuid}@{host}:443?encryption=none&security=tls"
+                f"vless://{uuid}@{host_for_url(host)}:{port}?encryption=none&security=tls"
                 f"&type=ws&host={sni}&fp={fp}&sni={sni}"
                 f"&path={quote(ws_path, safe='')}#{quote(name, safe='')}"
             )
         sub_path = os.path.join(out_dir, "pool.txt")
         with open(sub_path, "w", encoding="utf-8") as f:
-            f.write("# Cloudflare 边缘优选订阅 (vless:// 明文, 自动刷新)\n")
+            f.write("# Cloudflare 边缘优选订阅 (vless:// 明文, 手动名单刷新)\n")
             f.write(f"# 更新时间: {now} (北京时间)\n")
-            f.write(f"# 每个池子 IP 一条直连节点, SNI={sni}, 共 {len(picked)} 个\n")
+            f.write(f"# 名单来自 preferred_hosts.txt, SNI={sni}, 共 {len(picked)} 个\n")
             f.write("\n".join(link_lines) + "\n")
         clash_path = os.path.join(out_dir, "pool.yaml")
         with open(clash_path, "w", encoding="utf-8") as f:
-            f.write("# Cloudflare 边缘优选 Clash 订阅 (自动刷新)\n")
+            f.write("# Cloudflare 边缘优选 Clash 订阅 (手动名单刷新)\n")
             f.write(f"# 更新时间: {now} (北京时间)\n")
             f.write("proxies:\n")
-            for name, ip, ws_path in nodes:
+            for name, host, port, ws_path in nodes:
                 f.write(f"  - name: \"{name}\"\n")
                 f.write("    type: vless\n")
-                f.write(f"    server: {ip}\n")
-                f.write("    port: 443\n")
+                f.write(f"    server: {host}\n")
+                f.write(f"    port: {port}\n")
                 f.write(f"    uuid: {uuid}\n")
                 f.write("    tls: true\n")
                 f.write(f"    servername: {sni}\n")

@@ -59,9 +59,9 @@
 
   <h2>☁️ Cloudflare 优选池 <small style="color:var(--muted);font-weight:400">pool</small></h2>
   <div class="cards" id="pool-cards"></div>
-  <div class="note">延迟最低的前 10 个入口：</div>
+  <div class="note">手动名单 (preferred_hosts.txt) 的前 10 个入口：</div>
   <div class="pool-table"><table>
-    <thead><tr><th>#</th><th>IP</th><th>端口</th><th>延迟</th></tr></thead>
+    <thead><tr><th>#</th><th>IP / 域名</th><th>端口</th><th>延迟</th></tr></thead>
     <tbody id="pool-top"></tbody>
   </table></div>
 
@@ -156,11 +156,11 @@ function renderPool() {
   if (!d) { document.getElementById('pool-cards').innerHTML = '<div class="empty">优选池数据加载失败</div>'; return; }
   const es = d.entries || [];
   document.getElementById('pool-cards').innerHTML =
-    card('池子 IP 数', es.length) + card('采样数', d.sampled || '—') + card('可用数', d.reachable || '—') +
+    card('池子节点数', es.length) + card('录入数', d.sampled || '—') + card('可用数', d.reachable || '—') +
     card('更新时间', '<small>' + esc(d.updated_at || '—') + '</small>');
   document.getElementById('pool-top').innerHTML = es.slice(0, 10).map(function (e, i) {
     return '<tr><td>' + (i + 1) + '</td><td><code>' + esc(e.ip) + '</code></td><td>' + esc(e.port) + '</td>' +
-      '<td class="lat">' + esc(e.latency_ms) + ' ms</td></tr>';
+      '<td class="lat">' + (e.latency_ms == null ? '手动' : esc(e.latency_ms) + ' ms') + '</td></tr>';
   }).join('') || '<tr><td colspan="4" class="empty">暂无数据</td></tr>';
 }
 
