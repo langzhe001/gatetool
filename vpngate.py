@@ -562,12 +562,39 @@ EDGE_HOSTS = [
 
 HOSTS_URL = os.environ.get("HOSTS_URL", _site_file("sstp-hosts.txt"))
 
+def _edge_entries():
+    """优选入口池 (sstp-hosts 清单与 sstp.txt / sstp.yaml 订阅的 server 共用同一份):
+    默认循环使用 EDGE_HOSTS; 可用 HOSTS_ENTRY 覆盖(逗号分隔); 都为空时回退 EDT_DOMAIN:443。"""
+    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
+    return [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+
+
+def _split_entry(entry):
+    """把优选入口 'host' / 'host:port' / '[ipv6]:port' 拆成 (host, port), 无端口默认 443。"""
+    s = str(entry).strip()
+    if s.startswith("["):
+        end = s.find("]")
+        if end > 0:
+            rest = s[end + 1:]
+            if rest.startswith(":") and rest[1:].isdigit():
+                return s[1:end], int(rest[1:])
+            return s[1:end], 443
+    if s.count(":") == 1:
+        h, p = s.rsplit(":", 1)
+        if p.isdigit():
+            return h, int(p)
+    return s, 443
+
+
+def _url_host(host):
+    """vless URL 里的 server 写法: IPv6 需加方括号, 其余原样。"""
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
 def build_hosts_text(data):
     """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
     每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 3 小时自动换。"""
-    # 入口: 默认循环使用 EDGE_HOSTS; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
-    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    edge = _edge_entries()
 
     lines = [
         "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)",
@@ -650,19 +677,23 @@ def build_sub_text(data):
         "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
         f"# 自动更新: {data['generated_at']} (每 3 小时重新检测)",
         f"# 固定地址: {SUB_URL}",
-        f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
+        f"# 入口 server: 优选域名循环分配 (EDGE_HOSTS, 可用 HOSTS_ENTRY 覆盖); SNI/Host: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
         "# 名字固定; $sstp:// 链式代理(编码在 path)每 3 小时自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
         "# ========================================================",
     ]
+    edge = _edge_entries()
+    idx = 0
     for cname, grp in _sorted_countries(data):
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
         for i, n in enumerate(_sorted_nodes(grp), 1):
             name = f"{zh}-{i:02d}-sstp"
             path = quote(_chain_path(n), safe="")
+            srv_host, srv_port = _split_entry(edge[idx % len(edge)])
+            idx += 1
             link = (
-                f"vless://{EDT_UUID}@{EDT_DOMAIN}:443?security=tls&type=ws"
+                f"vless://{EDT_UUID}@{_url_host(srv_host)}:{srv_port}?security=tls&type=ws"
                 f"&host={EDT_DOMAIN}&fp={EDT_FINGERPRINT}&sni={EDT_DOMAIN}"
                 f"&path={path}&encryption=none&alpn=#{quote(name, safe='')}"
             )
@@ -676,6 +707,8 @@ def build_clash_text(data):
     用 JSON 写法输出 YAML (JSON 是合法 YAML), 避免特殊字符转义问题。"""
     names, items = [], []
     used = set()
+    edge = _edge_entries()
+    idx = 0
     for cname, grp in _sorted_countries(data):
         code = str(grp.get("code") or "?").upper()
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
@@ -687,11 +720,13 @@ def build_clash_text(data):
                 k += 1
             used.add(name)
             names.append(name)
+            srv_host, srv_port = _split_entry(edge[idx % len(edge)])
+            idx += 1
             items.append("  - " + json.dumps({
                 "name": name,
                 "type": "vless",
-                "server": EDT_DOMAIN,
-                "port": 443,
+                "server": srv_host,
+                "port": srv_port,
                 "uuid": EDT_UUID,
                 "udp": True,
                 "tls": True,
