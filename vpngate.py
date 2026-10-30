@@ -562,11 +562,44 @@ EDGE_HOSTS = [
 
 HOSTS_URL = os.environ.get("HOSTS_URL", _site_file("sstp-hosts.txt"))
 
+def _load_preferred_hosts():
+    """读 pool 的手动优选名单 preferred_hosts.txt (与 refresh_pool.py 共用同一份文件、
+    同一套格式: 一行一个 IP/域名, 可带 :端口, # 注释与空行忽略, URL 粘贴自动清洗, 去重保序)。
+    路径可用环境变量 PREFERRED_HOSTS_FILE 覆盖, 默认脚本同目录。读不到/无有效条目时返回 []。"""
+    path = os.environ.get("PREFERRED_HOSTS_FILE", "").strip() or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "preferred_hosts.txt")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    entries, seen = [], set()
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        s = s.split("#", 1)[0].strip()
+        s = s.split()[0].strip(",;") if s.split() else ""
+        if "://" in s:
+            s = s.split("://", 1)[1]
+        s = s.split("/", 1)[0].strip()
+        if not s or s.lower() in seen:
+            continue
+        seen.add(s.lower())
+        entries.append(s)
+    return entries
+
+
 def _edge_entries():
-    """优选入口池 (sstp-hosts 清单与 sstp.txt / sstp.yaml 订阅的 server 共用同一份):
-    默认循环使用 EDGE_HOSTS; 可用 HOSTS_ENTRY 覆盖(逗号分隔); 都为空时回退 EDT_DOMAIN:443。"""
+    """优选入口池 (sstp-hosts 清单与 sstp.txt / sstp.yaml 订阅的 server 共用同一份), 优先级:
+    1. HOSTS_ENTRY 环境变量覆盖 (逗号分隔)
+    2. pool 的手动优选名单 preferred_hosts.txt (棱镜优选域名工具一键上传的就是这份)
+    3. 内置 EDGE_HOSTS (名单还没填时的回退, 保证订阅不断供)
+    4. EDT_DOMAIN:443 (最终回退)"""
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    return [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    if _entry:
+        return [e.strip() for e in _entry.split(",") if e.strip()]
+    return _load_preferred_hosts() or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
 
 
 def _split_entry(entry):
@@ -677,7 +710,7 @@ def build_sub_text(data):
         "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
         f"# 自动更新: {data['generated_at']} (每 3 小时重新检测)",
         f"# 固定地址: {SUB_URL}",
-        f"# 入口 server: 优选域名循环分配 (EDGE_HOSTS, 可用 HOSTS_ENTRY 覆盖); SNI/Host: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
+        f"# 入口 server: 优选域名循环分配 (pool 手动名单 preferred_hosts.txt, 可用 HOSTS_ENTRY 覆盖); SNI/Host: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
         "# 名字固定; $sstp:// 链式代理(编码在 path)每 3 小时自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
         "# ========================================================",
